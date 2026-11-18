@@ -2,12 +2,17 @@ name: Bot alertes trading
 
 on:
   schedule:
-    - cron: "5 * * * *"   # toutes les heures, à H+5
-  workflow_dispatch:       # permet de le lancer à la main pour tester
+    - cron: "*/5 * * * *"   # toutes les 5 minutes (si repo privé : "*/30 * * * *")
+  workflow_dispatch:         # permet de le lancer à la main pour tester
+
+concurrency:
+  group: bot-alertes
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
