@@ -1,88 +1,89 @@
 """
-Bot d'alertes crypto -> notification iPhone (ntfy)
-- Lit les prix sur Binance (API publique, pas de clé nécessaire)
-- Envoie une alerte quand :
-    * RSI passe sous 30 (survente = prix bas, possible moment d'achat)
-    * RSI passe au-dessus de 70 (surchauffe = prudence)
-    * Le prix chute de plus de X% en 24h
-- Ne passe AUCUN ordre : il te prévient, c'est toi qui décides.
+Bot d'alertes : TOUTES les cryptos (paires USDT sur Binance) -> notification iPhone (ntfy)
+
+Chaque heure, le bot scanne tout le marché et t'envoie UNE notification
+avec les cryptos qui viennent de monter fort (classées de la plus forte à la plus faible).
+Il ne passe AUCUN ordre : il te prévient, c'est toi qui décides.
 """
 import os
+import time
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 # ====== RÉGLAGES (modifie ici) ======
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]  # cryptos à surveiller
-INTERVAL = "1h"        # bougies de 1 heure
-RSI_PERIOD = 14
-RSI_BAS = 30
-RSI_HAUT = 70
-CHUTE_24H_PCT = 5      # alerte si le prix baisse de plus de 5% en 24h
+HAUSSE_1H_PCT = 3          # une crypto qui monte de +3% sur la dernière heure déclenche l'alerte
+HAUSSE_24H_PCT = 10        # ou +10% sur 24h
+VOLUME_MIN_USDT = 5_000_000  # ignore les cryptos peu échangées (évite les pièges)
+NB_MAX_DANS_ALERTE = 10    # nombre max de cryptos listées dans la notif
 # ====================================
 
-TOPIC = os.environ["NTFY_TOPIC"]  # le nom secret de ton "canal" ntfy
+TOPIC = os.environ["NTFY_TOPIC"]
 API = "https://data-api.binance.vision/api/v3"
+STABLES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "AEUR", "USDE", "XUSD", "BFUSD", "PYUSD"}
 
 
 def envoyer(message):
-    requests.post(
-        f"https://ntfy.sh/{TOPIC}",
-        data=message.encode("utf-8"),
-        timeout=15,
-    )
+    requests.post(f"https://ntfy.sh/{TOPIC}", data=message.encode("utf-8"), timeout=15)
 
 
-def get_closes(symbol):
-    r = requests.get(
-        f"{API}/klines",
-        params={"symbol": symbol, "interval": INTERVAL, "limit": 200},
-        timeout=15,
-    )
+def liste_cryptos():
+    """Toutes les paires USDT assez échangées."""
+    r = requests.get(f"{API}/ticker/24hr", timeout=30)
     r.raise_for_status()
-    # on enlève la dernière bougie (pas encore fermée)
-    return [float(k[4]) for k in r.json()][:-1]
-
-
-def rsi_series(closes, period=14):
-    """RSI de Wilder, renvoie la liste des RSI."""
-    gains, pertes = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        pertes.append(max(-diff, 0))
-    avg_g = sum(gains[:period]) / period
-    avg_p = sum(pertes[:period]) / period
     out = []
-    for i in range(period, len(gains)):
-        avg_g = (avg_g * (period - 1) + gains[i]) / period
-        avg_p = (avg_p * (period - 1) + pertes[i]) / period
-        rs = avg_g / avg_p if avg_p != 0 else 999
-        out.append(100 - 100 / (1 + rs))
+    for t in r.json():
+        s = t["symbol"]
+        if not s.endswith("USDT"):
+            continue
+        base = s[:-4]
+        if base in STABLES or base.endswith(("UP", "DOWN", "BULL", "BEAR")):
+            continue
+        if float(t["quoteVolume"]) < VOLUME_MIN_USDT:
+            continue
+        out.append(s)
     return out
 
 
-def verifier(symbol):
-    closes = get_closes(symbol)
-    rsi = rsi_series(closes, RSI_PERIOD)
-    rsi_now, rsi_prev = rsi[-1], rsi[-2]
-    prix = closes[-1]
+def analyser(symbol):
+    try:
+        r = requests.get(
+            f"{API}/klines",
+            params={"symbol": symbol, "interval": "1h", "limit": 26},
+            timeout=15,
+        )
+        r.raise_for_status()
+        k = r.json()[:-1]  # on enlève la bougie en cours (pas fermée)
+        if len(k) < 25:
+            return None
+        ouv, clo = float(k[-1][1]), float(k[-1][4])
+        h1 = (clo - ouv) / ouv * 100
+        h24 = (clo - float(k[-25][4])) / float(k[-25][4]) * 100
+        if h1 >= HAUSSE_1H_PCT or h24 >= HAUSSE_24H_PCT:
+            return (symbol[:-4], h1, h24, clo)
+    except Exception as e:
+        print(f"Erreur {symbol}: {e}")
+    return None
 
-    # On alerte seulement au moment du franchissement (évite le spam)
-    if rsi_now < RSI_BAS <= rsi_prev:
-        envoyer(f"🟢 {symbol}: RSI {rsi_now:.0f} (survente)\nPrix: {prix:,.2f} $\nPossible zone d'achat, à toi de juger.")
-    elif rsi_now > RSI_HAUT >= rsi_prev:
-        envoyer(f"🔴 {symbol}: RSI {rsi_now:.0f} (surchauffe)\nPrix: {prix:,.2f} $\nPrudence avant d'acheter.")
 
-    # Chute sur 24h (24 bougies d'1h)
-    if len(closes) > 25:
-        var = (closes[-1] - closes[-25]) / closes[-25] * 100
-        var_prev = (closes[-2] - closes[-26]) / closes[-26] * 100
-        if var <= -CHUTE_24H_PCT < var_prev:
-            envoyer(f"⚠️ {symbol}: {var:.1f}% en 24h\nPrix: {prix:,.2f} $")
+def prix_txt(p):
+    return f"{p:,.2f}" if p >= 1 else f"{p:.6f}".rstrip("0")
 
 
 if __name__ == "__main__":
-    for s in SYMBOLS:
-        try:
-            verifier(s)
-        except Exception as e:
-            print(f"Erreur {s}: {e}")
+    symboles = liste_cryptos()
+    print(f"{len(symboles)} cryptos scannées")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        resultats = [r for r in ex.map(analyser, symboles) if r]
+
+    if resultats:
+        resultats.sort(key=lambda x: x[1], reverse=True)  # plus forte hausse 1h d'abord
+        lignes = [
+            f"{nom}: {h1:+.1f}% (1h) / {h24:+.1f}% (24h) - {prix_txt(p)} $"
+            for nom, h1, h24, p in resultats[:NB_MAX_DANS_ALERTE]
+        ]
+        reste = len(resultats) - NB_MAX_DANS_ALERTE
+        if reste > 0:
+            lignes.append(f"... et {reste} autres")
+        envoyer("📈 Cryptos en hausse\n" + "\n".join(lignes))
+    else:
+        print("Rien à signaler")
